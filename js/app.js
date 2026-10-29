@@ -12,7 +12,8 @@
     totalMs: 0,
     endsAt: 0,
     paused: false,
-    remainingMs: 0
+    remainingMs: 0,
+    pushId: ""
   };
   var audioCtx = null;
   var wakeLock = null;
@@ -434,11 +435,12 @@
   }
 
   function saveTimer() {
+    try { sessionStorage.removeItem("wt-timer"); } catch (err) {}
     if (timer.phase === "idle") {
-      sessionStorage.removeItem("wt-timer");
+      localStorage.removeItem("wt-timer");
       return;
     }
-    sessionStorage.setItem("wt-timer", JSON.stringify(timer));
+    localStorage.setItem("wt-timer", JSON.stringify(timer));
   }
 
   function remainingMs() {
@@ -502,13 +504,121 @@
     if (navigator.vibrate) navigator.vibrate([180, 80, 180, 80, 180]);
   }
 
-  function askNotify() {
-    if (typeof Notification === "undefined") return;
-    if (Notification.permission !== "default") return;
-    try {
-      var pending = Notification.requestPermission();
-      if (pending && pending.then) pending.then(function () { render(); }).catch(function () {});
-    } catch (err) {}
+  var pushSeq = 0;
+  var swReady = null;
+
+  function pushConfig() {
+    var cfg = window.PUSH_CONFIG;
+    if (!cfg || !cfg.publicKey || !cfg.endpoint) return null;
+    return cfg;
+  }
+
+  function urlBase64ToUint8Array(value) {
+    var padded = String(value).replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+    var raw = atob(padded);
+    var out = new Uint8Array(raw.length);
+    var i;
+    for (i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  function warmSw() {
+    if (!("serviceWorker" in navigator) || location.protocol === "file:") return;
+    swReady = navigator.serviceWorker.register("./sw.js").then(function () {
+      return navigator.serviceWorker.ready;
+    });
+    swReady.catch(function () { swReady = null; });
+  }
+
+  function subscribePush(forcePrompt) {
+    var cfg = pushConfig();
+    if (!cfg || !("PushManager" in window) || !("serviceWorker" in navigator)) return Promise.resolve(null);
+    if (!forcePrompt && (typeof Notification === "undefined" || Notification.permission !== "granted")) return Promise.resolve(null);
+    var pending = swReady || navigator.serviceWorker.ready;
+    return Promise.resolve(pending).then(function (reg) {
+      if (!reg || !reg.pushManager) return null;
+      return reg.pushManager.getSubscription().then(function (sub) {
+        if (sub) return sub;
+        return reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(cfg.publicKey)
+        });
+      });
+    });
+  }
+
+  function remoteCopy() {
+    var next = timer.queue ? timer.queue[timer.queueIndex + 1] : null;
+    if (timer.mode === "rest") {
+      var restBody = "Можно продолжать";
+      if (next) restBody = next.mode === "work" ? "Дальше: " + next.title : (next.detail || "Дальше");
+      return { title: "Отдых закончился", body: restBody };
+    }
+    if (next) {
+      var label = next.detail ? next.detail + " · " + next.title : next.title;
+      return { title: "Время вышло", body: "Дальше: " + label };
+    }
+    return { title: "Время вышло", body: timer.mode === "work" ? "Упражнение закончилось" : "Можно продолжать" };
+  }
+
+  function postPush(path, payload) {
+    var cfg = pushConfig();
+    if (!cfg) return Promise.resolve();
+    return fetch(cfg.endpoint.replace(/\/$/, "") + path, {
+      method: "POST",
+      mode: "cors",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true
+    });
+  }
+
+  function cancelRemote() {
+    pushSeq += 1;
+    var id = timer.pushId;
+    timer.pushId = "";
+    if (id) postPush("/cancel", { id: id }).catch(function () {});
+  }
+
+  function armRemote() {
+    if (!pushConfig() || timer.phase !== "run" || timer.paused) return;
+    var seq = ++pushSeq;
+    var previous = timer.pushId;
+    var id = uid();
+    var copy = remoteCopy();
+    var fireAt = timer.endsAt;
+    timer.pushId = id;
+    saveTimer();
+    if (previous && previous !== id) postPush("/cancel", { id: previous }).catch(function () {});
+    subscribePush(false).then(function (sub) {
+      if (seq !== pushSeq || !sub) return;
+      return postPush("/schedule", {
+        id: id,
+        fireAt: fireAt,
+        title: copy.title,
+        body: copy.body,
+        subscription: sub.toJSON()
+      });
+    }).catch(function () {});
+  }
+
+  function askNotify(manual) {
+    unlockAudio();
+    if (!pushConfig() || !("PushManager" in window)) {
+      if (typeof Notification === "undefined" || Notification.permission !== "default") return;
+      try {
+        var legacy = Notification.requestPermission();
+        if (legacy && legacy.then) legacy.then(function () { render(); }).catch(function () {});
+      } catch (err) {}
+      return;
+    }
+    subscribePush(true).then(function () {
+      if (timer.phase === "run" && !timer.paused) armRemote();
+      render();
+    }).catch(function () {
+      if (manual) toast("Не удалось включить уведомления. На айфоне откройте иконку на экране «Домой».");
+      render();
+    });
   }
 
   function fallbackNotify(title, body) {
@@ -550,7 +660,7 @@
 
   function startTimer(mode, seconds, title) {
     unlockAudio();
-    if (mode === "rest") askNotify();
+    askNotify(false);
     clearQueue();
     var ms = Math.max(1, Math.round(seconds) * 1000);
     timer.phase = "run";
@@ -562,6 +672,7 @@
     timer.remainingMs = ms;
     saveTimer();
     lockWake();
+    armRemote();
     render();
   }
 
@@ -580,6 +691,7 @@
     timer.doneTitle = "";
     saveTimer();
     lockWake();
+    armRemote();
     render();
     requestAnimationFrame(function () {
       var node = document.querySelector(".exercise.current");
@@ -596,7 +708,7 @@
       toast("Задайте время упражнения: " + missing[0].name);
       return;
     }
-    askNotify();
+    askNotify(false);
     unlockAudio();
     var rounds = Math.min(20, Math.max(1, Number(w.circuit.rounds) || 1));
     var rest = clampSec(Number(w.circuit.restSec) || 0, 15 * 60);
@@ -650,12 +762,15 @@
       timer.paused = false;
       timer.endsAt = Date.now() + timer.remainingMs;
       lockWake();
+      saveTimer();
+      armRemote();
     } else {
       timer.paused = true;
       timer.remainingMs = Math.max(0, timer.endsAt - Date.now());
       releaseWake();
+      cancelRemote();
+      saveTimer();
     }
-    saveTimer();
     render();
   }
 
@@ -666,10 +781,12 @@
     if (timer.paused) timer.remainingMs += extra;
     else timer.endsAt += extra;
     saveTimer();
+    if (!timer.paused) armRemote();
     paintTimer();
   }
 
   function stopTimer(silent) {
+    cancelRemote();
     timer.phase = "idle";
     timer.mode = null;
     clearQueue();
@@ -684,11 +801,13 @@
   function completeTimer() {
     if (timer.phase !== "run" || completing) return;
     completing = true;
+    var late = Date.now() - timer.endsAt;
+    cancelRemote();
     var finishedMode = timer.mode;
     var nextStep = timer.queue ? timer.queue[timer.queueIndex + 1] : null;
     var wasCircuit = !!timer.queue;
     beep();
-    if (finishedMode === "rest") {
+    if (finishedMode === "rest" && late < 1500) {
       var body = "Можно продолжать";
       if (nextStep) body = nextStep.mode === "work" ? "Дальше: " + nextStep.title : (nextStep.detail || "Дальше");
       notify("Отдых закончился", body);
@@ -718,18 +837,23 @@
 
   function restoreTimer() {
     try {
-      var raw = sessionStorage.getItem("wt-timer");
+      var raw = localStorage.getItem("wt-timer") || sessionStorage.getItem("wt-timer");
       if (!raw) return;
       var saved = JSON.parse(raw);
-      if (!saved || saved.phase === "idle") return;
-      if (saved.phase === "done") return;
+      if (!saved || saved.phase === "idle" || saved.phase === "done") return;
       timer = saved;
+      if (!timer.pushId) timer.pushId = "";
       if (!timer.paused && timer.endsAt <= Date.now()) {
-        stopTimer(true);
+        if (Date.now() - timer.endsAt < 15 * 60 * 1000) setTimeout(function () { completeTimer(); }, 0);
+        else {
+          stopTimer(true);
+          toast("Таймер уже закончился");
+        }
         return;
       }
       if (!timer.paused) lockWake();
     } catch (err) {
+      localStorage.removeItem("wt-timer");
       sessionStorage.removeItem("wt-timer");
     }
   }
@@ -1066,16 +1190,16 @@
       '<label class="btn secondary file-btn">Импорт из файла<input id="import-file" type="file" accept="application/json,.json"></label></div>' +
       '<article class="note section-gap"><strong>Уведомления.</strong> ' + esc(notifyHint()) + '</article>' +
       (typeof Notification !== "undefined" && Notification.permission !== "granted" ? '<button type="button" class="btn secondary section-gap" data-action="ask-notify">Включить уведомления</button>' : "") +
-      '<article class="note section-gap"><strong>На айфоне.</strong> Откройте эту страницу в Safari, нажмите «Поделиться» и выберите «На экран Домой». Уведомление об отдыхе приходит, если оно разрешено. Если очистить данные сайта, тренировки сотрутся — перед этим сделайте экспорт.</article>' +
+      '<article class="note section-gap"><strong>На айфоне.</strong> Safari → «Поделиться» → «На экран Домой», затем откройте приложение с иконки и разрешите уведомления. Тогда сообщение придёт, даже если приложение закрыто. На сервер уходит только текст этого напоминания, не журнал тренировок. Если очистить данные сайта, тренировки сотрутся — перед этим сделайте экспорт.</article>' +
       '<button type="button" class="btn danger section-gap" data-action="ask-clear">Удалить все данные</button></section>'
     );
   }
 
   function notifyHint() {
     if (typeof Notification === "undefined") return "Этот браузер не показывает системные уведомления. Сигнал в конце отдыха всё равно прозвучит.";
-    if (Notification.permission === "granted") return "Уведомления включены. Когда отдых закончится, придёт сообщение.";
-    if (Notification.permission === "denied") return "Уведомления запрещены в настройках браузера. На айфоне разрешите их для иконки на экране «Домой».";
-    return "Разрешите уведомления, чтобы телефон сообщил, когда отдых закончился.";
+    if (Notification.permission === "granted") return "Уведомления включены. Сообщение придёт в конце шага, даже если приложение закрыто. На айфоне откройте его с иконки на экране «Домой».";
+    if (Notification.permission === "denied") return "Уведомления запрещены. На айфоне разрешите их в Настройках для приложения «Тренировки».";
+    return "Разрешите уведомления. На айфоне это работает у иконки на экране «Домой»: сообщение придёт, даже если приложение закрыто.";
   }
 
   function missing(text) {
@@ -1293,7 +1417,7 @@
     }
     if (action === "start-circuit") { startCircuit(id); return; }
     if (action === "skip-step") { skipStep(); return; }
-    if (action === "ask-notify") { askNotify(); return; }
+    if (action === "ask-notify") { askNotify(true); return; }
     if (action === "start-rest") {
       var restFound = findExercise(exId);
       if (!restFound) return;
@@ -1409,8 +1533,14 @@
     window.addEventListener("resize", layoutDocks);
     document.addEventListener("visibilitychange", function () {
       if (document.visibilityState === "visible") {
-        if (timer.phase === "run" && !timer.paused && timer.endsAt <= Date.now()) completeTimer();
-        else paintTimer();
+        if (timer.phase === "run" && !timer.paused && timer.endsAt <= Date.now()) {
+          if (Date.now() - timer.endsAt < 15 * 60 * 1000) completeTimer();
+          else {
+            stopTimer(true);
+            toast("Таймер уже закончился");
+            render();
+          }
+        } else paintTimer();
         lockWake();
       }
     });
@@ -1425,7 +1555,5 @@
     else paintTimer();
   }, 200);
 
-  if ("serviceWorker" in navigator && location.protocol !== "file:") {
-    navigator.serviceWorker.register("./sw.js").catch(function () {});
-  }
+  if ("serviceWorker" in navigator && location.protocol !== "file:") warmSw();
 })();

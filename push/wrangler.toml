@@ -1,0 +1,12 @@
+name = "trenirovki-push"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+
+[durable_objects]
+bindings = [
+  { name = "SCHEDULER", class_name = "Scheduler" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Scheduler"]

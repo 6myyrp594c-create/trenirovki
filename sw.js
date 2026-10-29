@@ -1,9 +1,10 @@
-var CACHE = "workout-tracker-v3";
+var CACHE = "workout-tracker-v4";
 var FILES = [
   "./",
   "./index.html",
   "./css/app.css",
   "./js/store.js",
+  "./js/push-config.js",
   "./js/app.js",
   "./manifest.webmanifest",
   "./icons/icon-180.png",
@@ -31,6 +32,20 @@ self.addEventListener("activate", function (event) {
       );
     }).then(function () { return self.clients.claim(); })
   );
+});
+
+self.addEventListener("push", function (event) {
+  var data = { title: "Тренировки", body: "Таймер завершён" };
+  try {
+    if (event.data) data = Object.assign(data, event.data.json());
+  } catch (err) {}
+  event.waitUntil(self.registration.showNotification(data.title || "Тренировки", {
+    body: data.body || "Таймер завершён",
+    tag: "workout-rest",
+    renotify: true,
+    icon: "./icons/icon-192.png",
+    data: { url: "./" }
+  }));
 });
 
 self.addEventListener("notificationclick", function (event) {

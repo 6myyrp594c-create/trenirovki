@@ -1,0 +1,9 @@
+push/vapid.pem
+push/vapid.private.json
+push/vapid.public.txt
+push/node_modules
+push/.wrangler
+push/.dev.vars
+push/wrangler.local.toml
+push/secrets.json
+push/vector-test.mjs
