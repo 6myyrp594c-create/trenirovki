@@ -1,4 +1,4 @@
-var CACHE = "workout-tracker-v4";
+var CACHE = "workout-tracker-v5";
 var FILES = [
   "./",
   "./index.html",

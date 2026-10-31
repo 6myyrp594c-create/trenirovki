@@ -4,10 +4,11 @@
   var DURATION_PRESETS = [0, 30, 45, 60, 90, 120];
 
   var state = WorkoutStore.load();
-  var ui = { route: parseRoute(), sheet: null, dialog: null };
+  var ui = { route: parseRoute(), sheet: null, dialog: null, photos: null, plan: false };
   var timer = {
     phase: "idle",
     mode: null,
+    kind: "",
     title: "",
     totalMs: 0,
     endsAt: 0,
@@ -550,8 +551,7 @@
   function remoteCopy() {
     var next = timer.queue ? timer.queue[timer.queueIndex + 1] : null;
     if (timer.mode === "rest") {
-      var restBody = "Можно продолжать";
-      if (next) restBody = next.mode === "work" ? "Дальше: " + next.title : (next.detail || "Дальше");
+      var restBody = next ? "Дальше: " + next.title : "Можно продолжать";
       return { title: "Отдых закончился", body: restBody };
     }
     if (next) {
@@ -647,9 +647,14 @@
     timer.queueIndex = 0;
     timer.workoutId = null;
     timer.doneTitle = "";
+    timer.kind = "";
   }
 
   function syncTitle() {
+    if (timer.phase === "hold") {
+      document.title = timer.title || "Тренировка";
+      return;
+    }
     if (timer.phase !== "run") {
       document.title = "Тренировки";
       return;
@@ -689,6 +694,7 @@
     timer.paused = false;
     timer.remainingMs = ms;
     timer.doneTitle = "";
+    ui.plan = false;
     saveTimer();
     lockWake();
     armRemote();
@@ -740,20 +746,156 @@
     }
     timer.queue = steps;
     timer.workoutId = w.id;
+    timer.kind = "circuit";
+    ui.plan = false;
     runQueueStep(0);
   }
 
-  function skipStep() {
-    if (timer.phase !== "run" || !timer.queue) return;
-    var next = timer.queueIndex + 1;
-    if (next >= timer.queue.length) {
-      timer.doneTitle = "Круговая закончена";
-      stopTimer(false);
-      toast("Круговая закончена");
+  function sessionKind() {
+    if (timer.kind === "sets" || timer.kind === "circuit") return timer.kind;
+    var first = timer.queue && timer.queue[0];
+    if (!first) return "";
+    return first.mode === "set" ? "sets" : "circuit";
+  }
+
+  function stageVisible() {
+    if (ui.plan) return false;
+    if (!ui.route || ui.route.name !== "workout") return false;
+    if (!timer.workoutId || timer.workoutId !== ui.route.id) return false;
+    if (timer.phase !== "hold" && timer.phase !== "run" && timer.phase !== "done") return false;
+    return !!(timer.queue || timer.phase === "done");
+  }
+
+  function safeImage(url) {
+    if (!url || typeof url !== "string") return "";
+    if (/^data:image\/(jpeg|png|webp);base64,[a-z0-9+/=]+$/i.test(url) && url.length < 700000) return url;
+    try {
+      var parsed = new URL(url);
+      if (parsed.protocol === "https:") return url;
+    } catch (err) {}
+    return "";
+  }
+
+  function queueStep(offset) {
+    if (!timer.queue) return null;
+    return timer.queue[timer.queueIndex + offset] || null;
+  }
+
+  function exerciseOf(step) {
+    if (!step || !step.exerciseId) return null;
+    var found = findExercise(step.exerciseId);
+    return found ? found.exercise : null;
+  }
+
+  function finishSession(title) {
+    cancelRemote();
+    timer.phase = "done";
+    timer.mode = null;
+    timer.paused = false;
+    timer.remainingMs = 0;
+    timer.endsAt = 0;
+    timer.doneTitle = title;
+    releaseWake();
+    saveTimer();
+    syncTitle();
+    render({ scroll: 0 });
+  }
+
+  function showHold(index) {
+    var step = timer.queue && timer.queue[index];
+    if (!step) {
+      finishSession("Тренировка закончена");
       return;
     }
+    cancelRemote();
+    ui.plan = false;
+    timer.queueIndex = index;
+    timer.phase = "hold";
+    timer.mode = "set";
+    timer.kind = "sets";
+    timer.title = step.detail ? step.detail + " · " + step.title : step.title;
+    timer.totalMs = 0;
+    timer.endsAt = 0;
+    timer.paused = false;
+    timer.remainingMs = 0;
+    timer.doneTitle = "";
+    releaseWake();
+    saveTimer();
+    syncTitle();
+    render({ scroll: 0 });
+  }
+
+  function advanceOrFinish() {
+    var next = timer.queueIndex + 1;
+    if (!timer.queue || next >= timer.queue.length) {
+      finishSession(sessionKind() === "sets" ? "Тренировка закончена" : "Круговая закончена");
+      return;
+    }
+    if (timer.queue[next].mode === "set") showHold(next);
+    else runQueueStep(next);
+  }
+
+  function beginRest() {
+    if (sessionKind() !== "sets" || timer.phase !== "hold") return;
+    var step = queueStep(0);
+    if (!step) return;
+    if (!step.restSec) {
+      advanceOrFinish();
+      return;
+    }
+    askNotify(false);
     unlockAudio();
-    runQueueStep(next);
+    var ms = Math.max(1, Math.round(step.restSec) * 1000);
+    timer.phase = "run";
+    timer.mode = "rest";
+    timer.title = "Отдых · " + step.title;
+    timer.totalMs = ms;
+    timer.endsAt = Date.now() + ms;
+    timer.paused = false;
+    timer.remainingMs = ms;
+    ui.plan = false;
+    saveTimer();
+    lockWake();
+    armRemote();
+    render({ scroll: 0 });
+  }
+
+  function startGuided(workoutId) {
+    var w = findWorkout(workoutId);
+    if (!w || !w.exercises.length) {
+      toast("Сначала добавьте упражнение");
+      return;
+    }
+    var steps = [];
+    w.exercises.forEach(function (ex) {
+      (ex.sets || []).forEach(function (set, index) {
+        steps.push({
+          mode: "set",
+          seconds: 0,
+          title: ex.name,
+          detail: "Подход " + (index + 1) + " из " + ex.sets.length,
+          exerciseId: ex.id,
+          setId: set.id,
+          restSec: set.restSec || 0
+        });
+      });
+    });
+    if (!steps.length) {
+      toast("Добавьте подход");
+      return;
+    }
+    askNotify(false);
+    unlockAudio();
+    timer.kind = "sets";
+    timer.queue = steps;
+    timer.workoutId = w.id;
+    showHold(0);
+  }
+
+  function skipStep() {
+    if ((timer.phase !== "run" && timer.phase !== "hold") || !timer.queue) return;
+    unlockAudio();
+    advanceOrFinish();
   }
 
   function pauseTimer() {
@@ -804,8 +946,8 @@
     var late = Date.now() - timer.endsAt;
     cancelRemote();
     var finishedMode = timer.mode;
+    var kind = sessionKind();
     var nextStep = timer.queue ? timer.queue[timer.queueIndex + 1] : null;
-    var wasCircuit = !!timer.queue;
     beep();
     if (finishedMode === "rest" && late < 1500) {
       var body = "Можно продолжать";
@@ -814,25 +956,31 @@
       toast("Отдых закончился");
     }
     if (nextStep) {
-      runQueueStep(timer.queueIndex + 1);
       completing = false;
+      if (nextStep.mode === "set") showHold(timer.queueIndex + 1);
+      else runQueueStep(timer.queueIndex + 1);
       return;
     }
+    var guided = kind === "sets" || kind === "circuit";
     timer.phase = "done";
     timer.paused = false;
     timer.remainingMs = 0;
-    timer.doneTitle = wasCircuit ? "Круговая закончена" : (finishedMode === "rest" ? "Отдых закончился" : "Время упражнения вышло");
-    timer.queue = null;
-    timer.queueIndex = 0;
+    timer.doneTitle = kind === "sets" ? "Тренировка закончена" : (guided ? "Круговая закончена" : (finishedMode === "rest" ? "Отдых закончился" : "Время упражнения вышло"));
+    if (!guided) {
+      timer.queue = null;
+      timer.queueIndex = 0;
+    }
     releaseWake();
     saveTimer();
     syncTitle();
     if (finishedMode !== "rest") toast(timer.doneTitle);
     render();
     completing = false;
-    setTimeout(function () {
-      if (timer.phase === "done") stopTimer(false);
-    }, 4000);
+    if (!guided) {
+      setTimeout(function () {
+        if (timer.phase === "done") stopTimer(false);
+      }, 4000);
+    }
   }
 
   function restoreTimer() {
@@ -843,7 +991,8 @@
       if (!saved || saved.phase === "idle" || saved.phase === "done") return;
       timer = saved;
       if (!timer.pushId) timer.pushId = "";
-      if (!timer.paused && timer.endsAt <= Date.now()) {
+      if (!timer.kind) timer.kind = "";
+      if (timer.phase === "run" && !timer.paused && timer.endsAt <= Date.now()) {
         if (Date.now() - timer.endsAt < 15 * 60 * 1000) setTimeout(function () { completeTimer(); }, 0);
         else {
           stopTimer(true);
@@ -851,7 +1000,7 @@
         }
         return;
       }
-      if (!timer.paused) lockWake();
+      if (timer.phase === "run" && !timer.paused) lockWake();
     } catch (err) {
       localStorage.removeItem("wt-timer");
       sessionStorage.removeItem("wt-timer");
@@ -888,6 +1037,7 @@
       id: String(ex.id),
       name: String(ex.name || "Упражнение").trim().slice(0, 80) || "Упражнение",
       durationSec: clampSec(Number(ex.durationSec) || 0, 90 * 60),
+      image: safeImage(ex.image),
       sets: sets
     };
   }
@@ -1057,6 +1207,7 @@
         '<div class="ex-top"><h2 class="ex-name">' + esc(exercise.name) + '</h2>' +
           '<button type="button" class="icon-btn" data-action="exercise-menu" data-id="' + esc(workout.id) + '" data-ex="' + esc(exercise.id) + '" aria-label="Действия с упражнением">' + icon("more") + "</button></div>" +
         '<p class="memory">' + esc(header) + "</p>" +
+        photoRow(exercise) +
         sets +
         '<button type="button" class="add-inline" data-action="add-set" data-ex="' + esc(exercise.id) + '">Добавить подход</button>' +
         '<div class="duration-row"><div class="grow">' +
@@ -1111,13 +1262,95 @@
     return (
       '<article class="exercise circuit-card">' +
         '<h2 class="ex-name">Круговая</h2>' +
-        '<p class="memory">Сама переключает упражнения и отдых. В конце отдыха придёт уведомление.</p>' +
+        '<p class="memory">На экране по очереди упражнение и отдых. В конце отдыха придёт уведомление.</p>' +
         '<div class="fields">' +
           circuitStepper("Круги", "rounds", String(rounds), 1, w.id) +
           circuitStepper("Отдых", "rest", formatDuration(rest), 15, w.id) +
         "</div>" +
         '<div class="chips">' + chipsHtml + "</div>" +
         action +
+      "</article>"
+    );
+  }
+
+  function photoRow(exercise) {
+    var src = safeImage(exercise.image);
+    return (
+      '<div class="photo-row">' +
+        (src ? '<img class="ex-thumb" src="' + esc(src) + '" alt="" referrerpolicy="no-referrer">' : "") +
+        '<button type="button" class="add-inline photo-btn" data-action="open-photos" data-ex="' + esc(exercise.id) + '">' +
+          (src ? "Сменить картинку" : "Картинка") +
+        "</button></div>"
+    );
+  }
+
+  function stagePhoto(url, name) {
+    var src = safeImage(url);
+    if (src) return '<div class="stage-photo"><img src="' + esc(src) + '" alt="" referrerpolicy="no-referrer"></div>';
+    var letter = String(name || "?").trim().charAt(0).toUpperCase() || "?";
+    return '<div class="stage-fallback" aria-hidden="true">' + esc(letter) + "</div>";
+  }
+
+  function stageHtml(w) {
+    var kind = sessionKind();
+    var step = queueStep(0);
+    var done = timer.phase === "done";
+    var resting = !done && timer.phase === "run" && (timer.mode === "rest" || (step && step.mode === "rest"));
+    var next = queueStep(1);
+    var currentEx = exerciseOf(step);
+    var photoEx = resting ? (exerciseOf(next) || currentEx) : currentEx;
+    var photoName = photoEx ? photoEx.name : (step ? step.title : w.name);
+    var name = done ? (timer.doneTitle || "Готово") : (resting ? "Отдых" : (currentEx ? currentEx.name : (step ? step.title : w.name)));
+    var kicker = w.name;
+    if (!done && resting) kicker = "Отдых";
+    else if (!done && kind === "sets" && currentEx) {
+      var pos = w.exercises.findIndex(function (item) { return item.id === currentEx.id; }) + 1;
+      kicker = "Упражнение " + pos + " из " + w.exercises.length + (step && step.detail ? " · " + step.detail : "");
+    } else if (!done && step && step.detail) kicker = step.detail;
+    var nextLine = "";
+    if (!done && resting && next) nextLine = '<p class="stage-next">Дальше: ' + esc(next.title) + "</p>";
+    else if (!done && !resting && kind === "circuit" && next) nextLine = '<p class="stage-next">' + esc(next.mode === "rest" ? "Дальше: отдых" : "Дальше: " + next.title) + "</p>";
+    else if (!done && kind === "sets" && timer.phase === "hold") nextLine = '<p class="stage-next">' + (step && step.restSec ? "После отдыха откроется следующий подход" : "Дальше — следующий подход") + "</p>";
+    var clock = "";
+    if (!done && timer.phase === "run") {
+      var left = remainingMs();
+      var ratio = timer.totalMs ? Math.max(0, Math.min(1, left / timer.totalMs)) : 0;
+      clock = '<p class="stage-time" id="timer-remaining">' + formatDuration(Math.ceil(left / 1000)) + '</p><div class="track"><span id="timer-progress" style="transform:scaleX(' + ratio + ')"></span></div>';
+    }
+    var fields = "";
+    if (!done && !resting && kind === "sets" && currentEx && step && step.setId) {
+      var liveSet = currentEx.sets.filter(function (s) { return s.id === step.setId; })[0];
+      if (liveSet) {
+        fields = '<div class="fields stage-fields">' +
+          stepper("Вес, кг", "weight", numToInput(liveSet.weight), 2.5, currentEx.id, liveSet.id, "") +
+          stepper("Повторы", "reps", liveSet.reps == null ? "" : String(liveSet.reps), 1, currentEx.id, liveSet.id, "") +
+          "</div>";
+      }
+    }
+    var actions;
+    if (done) {
+      actions = '<button type="button" class="btn primary" data-action="record" data-id="' + esc(w.id) + '">Записать тренировку</button><button type="button" class="btn secondary" data-action="stop-timer">Закрыть</button>';
+    } else if (timer.phase === "hold") {
+      var restLabel = step && step.restSec ? "Отдых " + formatDuration(step.restSec) : "Следующий подход";
+      actions = '<button type="button" class="btn primary" data-action="begin-rest">' + esc(restLabel) + '</button><div class="stage-row"><button type="button" class="btn secondary" data-action="skip-step">Дальше</button><button type="button" class="btn secondary" data-action="stop-timer">Закончить</button></div>';
+    } else {
+      actions = '<div class="stage-row"><button type="button" class="btn secondary" data-action="add-timer">+30 сек</button><button type="button" class="btn secondary" data-action="pause-timer">' + (timer.paused ? "Продолжить" : "Пауза") + '</button></div><div class="stage-row"><button type="button" class="btn secondary" data-action="skip-step">Дальше</button><button type="button" class="btn secondary" data-action="stop-timer">Закончить</button></div>';
+    }
+    var progress = !done && timer.queue ? '<p class="stage-count">' + (timer.queueIndex + 1) + " / " + timer.queue.length + "</p>" : "";
+    var dots = "";
+    if (!done && timer.queue && timer.queue.length <= 16) {
+      dots = '<div class="dots" aria-hidden="true">' + timer.queue.map(function (_, i) {
+        return '<i class="' + (i === timer.queueIndex ? "on" : "") + '"></i>';
+      }).join("") + "</div>";
+    }
+    var klass = "stage" + (resting ? " rest" : "") + (done ? " done" : "");
+    return (
+      '<article class="' + klass + '">' + progress + dots +
+        '<p class="stage-kicker">' + esc(kicker) + "</p>" +
+        (done ? "" : stagePhoto(photoEx && photoEx.image, photoName)) +
+        '<h2 class="stage-title">' + esc(name) + "</h2>" + nextLine + clock + fields +
+        '<div class="stage-actions">' + actions + '</div>' +
+        (done ? "" : '<button type="button" class="stage-plan" data-action="show-plan">Список упражнений</button>') +
       "</article>"
     );
   }
@@ -1131,12 +1364,21 @@
     var sub = w.exercises.length + " " + plural(w.exercises.length, "упражнение", "упражнения", "упражнений");
     if (vol) sub += " · объём " + formatInt(vol) + " кг";
     if (mem.kind === "previous" && volume(mem.session.exercises)) sub += " · прошлый объём " + formatInt(volume(mem.session.exercises)) + " кг";
-    var body = circuitCard(w) + (w.exercises.length
+    var onStage = stageVisible();
+    var sessionHere = timer.workoutId === w.id && timer.phase !== "idle";
+    var startBtn = !w.circuit && w.exercises.length && !sessionHere
+      ? '<button type="button" class="btn primary" data-action="start-guided" data-id="' + esc(w.id) + '">Начать тренировку</button>'
+      : "";
+    var backStage = sessionHere && !onStage
+      ? '<button type="button" class="btn secondary" data-action="show-stage">К текущему упражнению</button>'
+      : "";
+    var list = w.exercises.length
       ? w.exercises.map(function (ex) { return exerciseCard(w, ex); }).join("") +
         '<button type="button" class="btn secondary section-gap" data-action="ask-exercise" data-id="' + esc(w.id) + '">Добавить упражнение</button>' +
         '<a class="text-link section-gap" href="#/history/' + encodeURIComponent(w.id) + '">История этой тренировки</a>'
-      : '<div class="empty"><h2>Добавьте упражнение</h2><p>У каждого подхода будут вес, повторы и отдых. Для круговой у упражнения нужно время.</p><button type="button" class="btn primary" data-action="ask-exercise" data-id="' + esc(w.id) + '">Добавить упражнение</button></div>');
-    var dock = info.hidden ? "" : '<div class="save-dock"><button type="button" class="btn primary" id="record-btn" data-action="record" data-id="' + esc(w.id) + '"' + (info.disabled ? " disabled" : "") + ">" + esc(info.label) + '</button><p class="hint" id="record-status">' + esc(info.status) + "</p></div>";
+      : '<div class="empty"><h2>Добавьте упражнение</h2><p>У каждого подхода будут вес, повторы и отдых. Для круговой у упражнения нужно время.</p><button type="button" class="btn primary" data-action="ask-exercise" data-id="' + esc(w.id) + '">Добавить упражнение</button></div>';
+    var body = onStage ? stageHtml(w) : '<div class="stack">' + startBtn + (sessionHere ? "" : circuitCard(w)) + backStage + "</div>" + list;
+    var dock = info.hidden || onStage ? "" : '<div class="save-dock"><button type="button" class="btn primary" id="record-btn" data-action="record" data-id="' + esc(w.id) + '"' + (info.disabled ? " disabled" : "") + ">" + esc(info.label) + '</button><p class="hint" id="record-status">' + esc(info.status) + "</p></div>";
     return (
       '<section class="page"><div class="back-row"><a href="#/">' + icon("back") + "Тренировки</a></div>" +
       '<header class="top"><div><button type="button" class="title-btn" data-action="rename-workout" data-id="' + esc(w.id) + '">' + esc(w.name) + '</button><p class="subhead">' + esc(sub) + '</p></div>' +
@@ -1215,7 +1457,11 @@
   }
 
   function timerDock() {
-    if (timer.phase === "idle") return "";
+    if (timer.phase === "idle" || stageVisible()) return "";
+    if (timer.phase === "hold") {
+      var href = timer.workoutId ? "#/w/" + encodeURIComponent(timer.workoutId) : "#/";
+      return '<div class="timer-dock" role="status"><p class="timer-kicker">' + esc(timer.title || "Тренировка") + '</p><a class="btn secondary" href="' + href + '">К упражнению</a></div>';
+    }
     var left = timer.phase === "done" ? 0 : remainingMs();
     var ratio = timer.totalMs ? Math.max(0, Math.min(1, left / timer.totalMs)) : 0;
     var klass = timer.mode === "rest" ? "rest" : "work";
@@ -1238,6 +1484,106 @@
         '<p class="timer-kicker">' + esc(title) + "</p>" +
         '<p class="timer-time" id="timer-remaining">' + formatDuration(Math.ceil(left / 1000)) + "</p>" +
         '<div class="timer-actions">' + actions + "</div></div>"
+    );
+  }
+
+  function setExerciseImage(exId, image) {
+    var found = findExercise(exId);
+    if (!found) return;
+    var next = image ? safeImage(image) : "";
+    if (image && !next) {
+      toast("Эту картинку нельзя сохранить");
+      return;
+    }
+    var previous = found.exercise.image || "";
+    found.exercise.image = next;
+    found.workout.updatedAt = Date.now();
+    try {
+      WorkoutStore.save(state);
+    } catch (err) {
+      found.exercise.image = previous;
+      toast("Снимок слишком большой");
+      return;
+    }
+    ui.photos = null;
+    toast(next ? "Картинка сохранена" : "Картинка убрана");
+    render();
+  }
+
+  function readPhoto(file, cb) {
+    if (!file || !/^image\//.test(file.type || "")) {
+      toast("Нужен файл картинки");
+      return;
+    }
+    var blobUrl = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function () {
+      var edge = Math.max(img.width, img.height) || 1;
+      var scale = Math.min(1, 720 / edge);
+      var canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(blobUrl);
+      cb(canvas.toDataURL("image/jpeg", 0.72));
+    };
+    img.onerror = function () {
+      URL.revokeObjectURL(blobUrl);
+      toast("Не удалось открыть фото");
+    };
+    img.src = blobUrl;
+  }
+
+  function openPhotos(exId) {
+    var found = findExercise(exId);
+    if (!found) return;
+    ui.photos = { exId: exId, name: found.exercise.name, loading: true, items: [], error: false, empty: false };
+    render();
+    var query = found.exercise.name.trim() || "exercise";
+    var api = "https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrnamespace=6&gsrlimit=12&prop=imageinfo&iiprop=url|mime&iiurlwidth=480&gsrsearch=" + encodeURIComponent(query);
+    fetch(api).then(function (res) { return res.json(); }).then(function (data) {
+      if (!ui.photos || ui.photos.exId !== exId) return;
+      var pages = data && data.query && data.query.pages ? data.query.pages : {};
+      var items = [];
+      Object.keys(pages).forEach(function (key) {
+        var page = pages[key];
+        var info = page.imageinfo && page.imageinfo[0];
+        if (!info) return;
+        var mime = info.mime || "";
+        if (mime !== "image/jpeg" && mime !== "image/png" && mime !== "image/webp") return;
+        var src = info.thumburl || info.url;
+        if (!src || src.indexOf("https://") !== 0) return;
+        items.push({ url: src, thumb: src });
+      });
+      ui.photos.items = items.slice(0, 9);
+      ui.photos.loading = false;
+      ui.photos.empty = !items.length;
+      render();
+    }).catch(function () {
+      if (!ui.photos || ui.photos.exId !== exId) return;
+      ui.photos.loading = false;
+      ui.photos.error = true;
+      render();
+    });
+  }
+
+  function photosHtml() {
+    var picker = ui.photos;
+    if (!picker) return "";
+    var grid = '<p class="memory">Ищу картинки по названию…</p>';
+    if (picker.error) grid = '<p class="memory">Не удалось загрузить подбор. Можно добавить своё фото.</p>';
+    else if (!picker.loading && picker.empty) grid = '<p class="memory">По названию ничего не нашлось. Добавьте своё фото.</p>';
+    else if (!picker.loading) {
+      grid = '<div class="photo-grid">' + picker.items.map(function (item) {
+        return '<button type="button" class="photo-pick" data-action="pick-photo" data-ex="' + esc(picker.exId) + '" data-url="' + esc(item.url) + '"><img src="' + esc(item.thumb) + '" alt="" referrerpolicy="no-referrer"></button>';
+      }).join("") + "</div>";
+    }
+    return (
+      '<div class="backdrop" data-action="close-photos"><div class="sheet photo-sheet" role="dialog"><div class="handle"></div><h3>Картинка</h3>' +
+      '<p class="memory">Подбор из интернета по названию «' + esc(picker.name) + '». Снимки с Викисклада.</p>' +
+      grid +
+      '<label class="btn secondary section-gap file-btn">Своё фото<input id="exercise-photo" data-ex="' + esc(picker.exId) + '" type="file" accept="image/*"></label>' +
+      '<button type="button" class="btn danger section-gap" data-action="clear-photo" data-ex="' + esc(picker.exId) + '">Убрать картинку</button></div></div>'
     );
   }
 
@@ -1279,9 +1625,9 @@
       : ui.route.name === "session" ? viewSession()
       : ui.route.name === "settings" ? viewSettings()
       : viewHome();
-    document.getElementById("root").innerHTML = '<div class="app">' + view + timerDock() + sheetHtml() + dialogHtml() + nav() + "</div>";
+    document.getElementById("root").innerHTML = '<div class="app">' + view + timerDock() + sheetHtml() + dialogHtml() + photosHtml() + nav() + "</div>";
     document.body.classList.toggle("has-save", !!document.querySelector(".save-dock"));
-    document.body.classList.toggle("has-timer", timer.phase !== "idle");
+    document.body.classList.toggle("has-timer", timer.phase !== "idle" && !stageVisible());
     window.scrollTo(0, y);
     var auto = document.querySelector("[data-autofocus]");
     if (auto) {
@@ -1340,6 +1686,7 @@
     }
     if (action === "exercise-menu") {
       openSheet("Упражнение", [
+        { label: "Картинка", run: function () { openPhotos(exId); } },
         { label: "Переименовать", run: function () {
           var found = findExercise(exId);
           ui.dialog = { intent: "rename-exercise", title: "Название упражнения", input: found ? found.exercise.name : "", placeholder: "Название", confirm: "Сохранить", ex: exId };
@@ -1416,6 +1763,14 @@
       return;
     }
     if (action === "start-circuit") { startCircuit(id); return; }
+    if (action === "start-guided") { startGuided(id); return; }
+    if (action === "begin-rest") { beginRest(); return; }
+    if (action === "show-stage") { ui.plan = false; render({ scroll: 0 }); return; }
+    if (action === "show-plan") { ui.plan = true; render({ scroll: 0 }); return; }
+    if (action === "open-photos") { openPhotos(exId); return; }
+    if (action === "close-photos") { ui.photos = null; render(); return; }
+    if (action === "pick-photo") { setExerciseImage(exId, el.dataset.url); return; }
+    if (action === "clear-photo") { setExerciseImage(exId, ""); return; }
     if (action === "skip-step") { skipStep(); return; }
     if (action === "ask-notify") { askNotify(true); return; }
     if (action === "start-rest") {
@@ -1475,7 +1830,7 @@
       unlockAudio();
       var button = event.target.closest("[data-action]");
       if (!button) return;
-      if (button.dataset.action === "close-overlay" && event.target !== button) return;
+      if ((button.dataset.action === "close-overlay" || button.dataset.action === "close-photos") && event.target !== button) return;
       handleAction(button.dataset.action, button);
     });
     document.addEventListener("submit", function (event) {
@@ -1495,6 +1850,14 @@
       formatField(el);
     });
     document.addEventListener("change", function (event) {
+      if (event.target.id === "exercise-photo") {
+        var photoInput = event.target;
+        var photoId = photoInput.dataset.ex;
+        var photo = photoInput.files && photoInput.files[0];
+        photoInput.value = "";
+        if (photo) readPhoto(photo, function (data) { setExerciseImage(photoId, data); });
+        return;
+      }
       if (event.target.id !== "import-file") return;
       var file = event.target.files && event.target.files[0];
       event.target.value = "";
@@ -1528,6 +1891,8 @@
     window.addEventListener("hashchange", function () {
       ui.sheet = null;
       ui.dialog = null;
+      ui.photos = null;
+      ui.plan = false;
       render({ scroll: 0 });
     });
     window.addEventListener("resize", layoutDocks);
